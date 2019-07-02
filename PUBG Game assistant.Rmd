@@ -1,0 +1,478 @@
+---
+title: "PUBG Game Assistant"
+subtitle: "Prediction of final game ranking"
+output:
+  html_document:
+    highlight: tango
+    theme: spacelab
+  pdf_document:
+    highlight: zenburn
+---
+
+```{r set-options, echo=FALSE, cache=FALSE}
+options(width = 120)
+```
+
+
+```{r, echo = F, results = "hide", warning=FALSE, message=FALSE}
+library("tidyverse")
+library("ggplot2")
+library("corrplot")
+library("caTools")
+library("FNN")
+library("boot")
+library("glmnetUtils")
+library("xgboost")
+library("randomForest")
+library("caret")
+library("Metrics")
+library("gridExtra")
+library("onehot")
+library("pdp")
+```
+
+## Executive Summary
+
+AI-Game is a start-up focused on the development of game assistant for various computer games, includes PUBG (Playerunknown's Battlegrouns, an online multiplayer battle royale game). PUBG Game Assistant (PUBGGA) covers features such as player level-up, game history stastical analysis, player strategy suggestion. Based on in-game events, past game history, current game status, it will provide jump point suggestions, weapon choice suggestions, routing suggestions, safe zone prediction, etc.
+
+In this project, we will demostrate one of the functions: the prediction of final player ranking. Using the past matched data, we constructed and optimised several prediction models include Linear Regression, Lasso and Elastic-Net, Random Forest, Gradient Boosting Models. By comparing the test RMSE (Root Mean Square Erro), we chose Gradinet Boosting Moldel as our final prediction model, which achived the minimal test RMSE at 0.08999413. In the following sections, we will explain how we achived the final results.
+
+
+## Data Overview
+
+The dataset consists of PUBG game stats for more than 47,000 matches, obtained from official PUBG Open API website https://developer.pubg.com.
+
+```{r}
+train <- read.csv("train_V2.csv")
+head(train)
+```
+
+In a PUBG game, up to 100 players start in each match and they will get ranked at the end of the game based on how many other teams are still alive when they are eliminated.
+
+Every row is a player's match stats in one match. Here is a brief description of the columns.
+
+- "DBNOs": Number of enemy players knocked.  
+- "assists": Number of enemy players this player damaged that were killed by teammates.  
+-	"boosts": Number of boost items used.  
+-	"damageDealt": Total damage dealt. Note: Self inflicted damage is subtracted.  
+-	"headshotKills": Number of enemy players killed with headshots.
+-	"heals": Number of healing items used.
+-	"Id": Player’s Id
+-	"killPlace": Ranking in match of number of enemy players killed.
+-	"killPoints": Kills-based external ranking of player. (Think of this as an Elo ranking where only kills matter.) If there is a value other than -1 in rankPoints, then any 0 in killPoints should be treated as a “None”. 
+-	"killStreaks": Max number of enemy players killed in a short amount of time.
+-	"kills": Number of enemy players killed.
+-	"longestKill": Longest distance between player and player killed at time of death. This may be misleading, as downing a player and driving away may lead to a large longestKill stat.
+-	"matchDuration": Duration of match in seconds.
+-	"matchId": ID to identify match. There are no matches that are in both the training and testing set.
+-	"matchType": String identifying the game mode that the data comes from. The standard modes are “solo”, “duo”, “squad”, “solo-fpp”, “duo-fpp”, and “squad-fpp”; other modes are from events or custom matches. 
+-	"rankPoints": Elo-like ranking of player. This ranking is inconsistent and is being deprecated in the API’s next version, so use with caution. Value of -1 takes place of “None”.
+-	"revives": Number of times this player revived teammates.
+-	"rideDistance": Total distance traveled in vehicles measured in meters.
+-	"roadKills": Number of kills while in a vehicle.
+-	"swimDistance": Total distance traveled by swimming measured in meters.
+-	"teamKills": Number of times this player killed a teammate.
+-	"vehicleDestroys": Number of vehicles destroyed.
+-	"walkDistance": Total distance traveled on foot measured in meters.
+-	"weaponsAcquired": Number of weapons picked up.
+-	"winPoints": Win-based external ranking of player. (Think of this as an Elo ranking where only winning matters.) If there is a value other than -1 in rankPoints, then any 0 in winPoints should be treated as a “None”. 
+-	"groupId": ID to identify a group within a match. If the same group of players plays in different matches, they will have a different groupId each time.
+-	"numGroups": Number of groups we have data for in the match.
+-	"maxPlace": Worst placement we have data for in the match. This may not match with numGroups, as sometimes the data skips over placements. 
+-	"winPlacePerc": The target of prediction. This is a percentile winning placement, where 1 corresponds to 1st place, and 0 corresponds to last place in the match. It is calculated off of maxPlace, not numGroups, so it is possible to have missing chunks in a match.
+
+##  Data Cleaning
+
+### Missing Data
+In the training data, there is one particular player with a 'winPlacePerc' as NaN. The case was that this match had only one player. We will delete this row from our dataset. MacthType was stored as character, we will convert it into factor data.
+
+```{r message=FALSE}
+# Remove NAs
+train <- train[-(which(is.na(train$winPlacePerc))),]
+# Convert matchType into factors.
+train <- train%>%
+  mutate(matchType = as.factor(matchType))
+```
+
+
+### Detect and Remove Cheaters
+
+In computer games, there are always cheaters, same as in PUBG. We should remove such players from the training dataset so as not to get the model confused. We identified the following types of cheaters and removed them from the dataset:
+  
+**1. cheaters who kill the enemy without moving**
+
+There are some cheaters who achived kills but without moving. It is impossible in PUBG as at least players need to move around to find weapons to kill enemies.
+
+**2. cheaters who have 100% headshot rate**
+
+In the dataset, most players have a low headshot rate. However, there are a few players who can achive 100% headshot rate but with very high kills.
+
+**3. cheaters who have more than 10 road kills in vehicle**
+
+In PUBG, killing an enemy is very difficult when you are in a vehicle. But there are a few players who get more than 10 kills when they are in a vehicle.
+
+**4. cheaters who have longestkills more than 1 km**
+
+It is difficult to kill an enemy. If you kill an enemy in a long distance, that's even more difficult.
+
+**5. cheaters who pick up more than 80 weapons**
+
+In PUBG, most of the time, players are escaping the circle They don't have enough time to pick up over 80 weapons in a game, as most of players only pick up around 10 weapons.
+
+**6. cheaters who use more than 12 heal items**
+
+Most players in the game use only 5 healing items or less.
+
+```{r message=FALSE}
+# cheaters who kill the enemy without moving
+train$total_distance <- train$rideDistance + train$walkDistance + train$swimDistance
+train <- train %>%
+  mutate(cheater1 = ifelse(total_distance == 0 & kills >0, 1, 0))
+
+# cheaters who have 100% headshot rate
+train <- train %>%
+  mutate(cheater2 = ifelse(headshotKills/kills == 1 & kills>10, 1, 0))
+
+# cheaters who have more than 10 road kills in vehicle
+train <- train %>%
+  mutate(cheater3 = ifelse(roadKills >10, 1, 0))
+
+# cheaters who have longestkills more than 1000 km
+train <- train %>%
+  mutate(cheater4 = ifelse(longestKill>1000, 1, 0))
+
+# cheaters who pick up more than 80 weapons 
+train <- train %>%
+  mutate(cheater5 = ifelse(weaponsAcquired>80, 1, 0))
+
+# cheaters who use more than 12 heal items
+train <- train %>%
+  mutate(cheater6 = ifelse(heals>12, 1, 0))
+
+train <- train %>% filter(cheater1!=1 & cheater2!=1 & cheater3!=1 & cheater4!=1 & cheater5!=1 & cheater6!=1)
+train <- subset(train,select=-c(cheater1,cheater2,cheater3,cheater4,cheater5,cheater6))
+```
+
+
+## Data Visualization
+
+Let's first have a basic understanding of the data by plotting some stastics of the data.
+
+```{r}
+#plot Total number of each matchtype
+tem <- train %>% 
+  group_by(matchType) %>% 
+  summarise(tot = n())
+
+p1_matchtype <- tem %>%
+  ggplot(aes(x=reorder(tem$matchType, tem$tot), y=tot))+
+  geom_bar(stat = "Identity", aes(fill=tem$matchType))+
+  coord_flip()+ 
+  ggtitle("Total number of each matchtype") +
+  labs(x="Total number",y="matchtype") + 
+  theme_bw()+
+  theme(legend.position = "none",axis.text.x=element_text(angle = 0, vjust=0.5, size = 8), panel.grid.minor = element_blank())
+  
+#plot Duration Distribution of each match
+p2_matchduration <- train %>%
+  ggplot(aes(matchDuration)) +
+  geom_density(color='skyblue', fill='skyblue') +
+  ggtitle("Duration Distribution of each match") +
+  labs(x="Duration",y="Density") + 
+  theme_bw()+
+  theme(legend.position = "none",axis.text.x=element_text(angle = 0, vjust=0.5, size = 8), panel.grid.minor = element_blank())
+
+#plot the number of groups in each match
+p3_matchGroups <- train %>%
+  ggplot(aes(numGroups, color = train$matchType, fill = train$matchType)) +
+  geom_density(alpha = 0.5) +
+  ggtitle("Number of groups in each match") +
+  labs(x="Number of groups",y="Density") + 
+   theme_bw()+
+  theme(legend.position = "none",
+        axis.text.x=element_text(angle = 0, vjust=0.5, size = 8),
+        legend.text=element_text(size=0.5), 
+        panel.grid.minor =element_blank())
+
+#plot the number of players in each match
+tem2 <- train %>% 
+  group_by(matchId) %>% 
+  summarise(tot = n())
+
+p4_match_Num_Players <- tem2 %>%
+  ggplot(aes(tot)) +
+  geom_bar(fill='skyblue') +
+  ggtitle("Number of Players in each match") +
+  labs(x="Number of Players",y="count") + 
+  theme_bw()+
+  theme(legend.position = "none",
+        axis.text.x=element_text(angle = 0, vjust=0.5, size=8), 
+        panel.grid.minor = element_blank())
+
+gridExtra::grid.arrange(p1_matchtype, p2_matchduration, p3_matchGroups, p4_match_Num_Players, nrow = 2)
+```
+ 
+ **REMARK**: 
+ 
+In the first graph, we can tell that the most popular match type is squad-first person perspective. This indicates that most players prefer playing with friends to playing alone. The rank of game types is squad-fpp > duo-fpp > squad > solo-fpp > duo > solo > others.
+
+In the second graph, there are two peaks in macthDuration. Since maps with smaller sizes will accelerate the battle, the duration depends on which maps the players choose to play with (size of original island Erangel and desert locale Miramar are 8X8 km while size of Sanhok is 4X4 km).
+
+In the third graph, the ranking of groups distribution is 25(squad) > 50(duo) > 100(solo).
+
+In the forth graph, total number of player is close to 100.
+
+
+```{r}
+kills_plot <- function(train){
+  p_DBNOs <- train %>%  
+    mutate(DBNOs = replace(DBNOs, DBNOs>quantile(DBNOs,.99),'others')) %>%
+    ggplot(aes(DBNOs, fill = DBNOs)) +
+    geom_bar() +
+    theme(legend.position = "none")
+
+  p_kills <- train %>%  
+    mutate(kills = replace(kills, kills>quantile(kills,.99),'others')) %>%
+    ggplot(aes(kills, fill = kills)) +
+    geom_bar() +
+    theme(legend.position = "none")
+  
+  p_killStreaks <- train %>%  
+    mutate(killStreaks = replace(killStreaks, killStreaks>quantile(killStreaks,.99),'others')) %>%
+    ggplot(aes(killStreaks, fill = killStreaks)) +
+    geom_bar() +
+    theme(legend.position = "none")
+  
+  p_headshotKills <- train %>%  
+    mutate(headshotKills = replace(headshotKills, headshotKills>quantile(headshotKills,.99),'others')) %>%
+    ggplot(aes(headshotKills, fill = headshotKills)) +
+    geom_bar() +
+    theme(legend.position = "none")
+  
+  p_roadKills <- train %>%  
+    mutate(roadKills = replace(roadKills, roadKills>quantile(roadKills,.99),'others')) %>%
+    ggplot(aes(roadKills, fill = roadKills)) +
+    geom_bar() +
+    theme(legend.position = "none")
+  
+  p_teamKills <- train %>%  
+    mutate(teamKills = replace(teamKills, teamKills>quantile(teamKills,.99),'others')) %>%
+    ggplot(aes(teamKills, fill = teamKills)) +
+    geom_bar() +
+    theme(legend.position = "none")  
+  grid.arrange(p_DBNOs, p_kills, p_killStreaks, p_headshotKills, p_roadKills, p_teamKills, nrow = 3)
+}
+kills_plot(train)
+```
+
+**REMARK:** 
+
+From the graphs above, we can see that majority of players cannot get a single kill in a particular match. We may say that, either they believe in *LOVE & PEACE*, or it is really hard to kill an enemy in PUBG. We may also conclude that, PUBG is more like a surviving game but not a war game.
+
+```{r}
+# correlation heatmap
+train_cor<- names(train)[lapply(train,function(x) is.numeric(x))%>% unlist()]
+corrplot(cor(train[train_cor]), method="color", type = "full", tl.cex=0.6, tl.col="black", cl.cex=0.7, cl.ratio=0.2)
+```
+
+
+**REMARK:** 
+
+From the correlation matrix, we notice that some features are highly correlated:
+- "kills" and "killStreatks"
+- "kills" and "damageDealt"
+- "numberGroups" and "maxPlace"
+- "wlakDistance" and "winPlacePerc"
+
+
+## Modeling
+
+### Draw samples from the train data
+
+```{r message=F, error=F}
+# create new feature
+train <- train %>%
+  mutate(map = ifelse(matchDuration <=1600, "map_a", "map_b"))
+
+# Train Sample
+set.seed(123)
+train_fe <- subset(train, select=-c(Id,groupId,matchId,total_distance))
+
+train_fe$matchType <- as.character(train_fe$matchType)
+train_fe <- train_fe%>%
+  mutate(matchType = if_else(matchType %in% c("squad-fpp", "duo-fpp", "squad", "solo-fpp", "duo", "solo"), matchType, "others" ))
+
+train_fe$matchType <- as.factor(train_fe$matchType)
+train_fe$map <- as.factor(train_fe$map)
+
+encoder <- onehot(train_fe[,c("matchType","map")], max_levels = 100) 
+train_fe_onehot <- as.data.frame(predict(encoder, train_fe))
+train_fe <- cbind(subset(train_fe, select=-c(matchType,map)),train_fe_onehot)
+names(train_fe) <- make.names(names(train_fe))
+
+train_index_fe <- sample(nrow(train_fe), 10000, replace = FALSE)
+train_sample_fe <- train_fe[train_index_fe, ]
+
+# 70% dataset for train dataset and 30% for validation set
+set.seed(123)
+spl_fe <- sample.split(train_sample_fe$winPlacePerc, SplitRatio = 0.7)
+train_spl_fe <- subset(train_sample_fe, spl_fe == TRUE)
+validation_spl_fe <- subset(train_sample_fe, spl_fe == FALSE)
+```
+
+**REMARK:**
+ 
+By observing the data, we can find that there are in total 26 variables provided in the given dataset. Exclude **"Id"**,**"groupId"** and **"matchId"**, since they are not meaningful for predition. **"total_distance"** is highly correlated with the **"walkDistance"**, **"swimDistance"**, and **"rideDistance"**, and thus we only exclude **"total_Distance"** in our models.
+
+We create a new feature **"map"** which has two types "map_a" and "map_b" according to the analytics result from data visulization part.
+
+Since the dataset provided is to big, we only draw 10000 samples to test our models. 70% dataset for train dataset and 30% for validation set.
+ 
+
+###  Fit Models: Linear Regression, Regularization, Random Forest, XGBoost
+
+```{r}
+# linear regression
+set.seed(123)
+lm1 <- lm(winPlacePerc ~., data = train_spl_fe)
+lm_pred_train <- predict(lm1, data=train_spl_fe)
+lm_pred_test <- predict(lm1, data=validation_spl_fe)
+```
+
+```{r}
+# Elastic Net(LASSO)
+set.seed(123)
+en.cva <- cva.glmnet(winPlacePerc ~ ., train_spl_fe, use.model.frame=TRUE)
+
+alpha_opt <- en.cva$alpha[11] #1
+lambda_opt <- en.cva$modlist[[11]]$lambda.min #0.0001746339
+
+glmnet_pred_train <- predict(en.cva, s=lambda_opt, alpha = alpha_opt, newdata = train_spl_fe, exact=TRUE)
+glmnet_pred_test <- predict(en.cva, s=lambda_opt, alpha = alpha_opt, newdata = validation_spl_fe, exact=TRUE)
+```
+
+```{r}
+# random forest
+set.seed(123)
+# after tuning, optimal mtry is 18
+rf1 <- randomForest(winPlacePerc ~., data = train_spl_fe, mtry = 18, ntree = 501)
+
+rf_pred_train <- predict(rf1, newdata = train_spl_fe)
+rf_pred_test <- predict(rf1, newdata = validation_spl_fe)
+```
+
+```{r message=FALSE}
+# xgboost
+set.seed(123)
+
+winPlacePercColumn <- which(names(train_spl_fe) == 'winPlacePerc')
+x.train <- model.matrix(winPlacePerc ~ ., data=train_spl_fe)[, -winPlacePercColumn]
+y.train <- train_spl_fe[,winPlacePercColumn]
+
+winPlacePercColumn <- which(names(validation_spl_fe) == 'winPlacePerc')
+x.test <- model.matrix(winPlacePerc ~ ., data=validation_spl_fe)[ , -winPlacePercColumn]
+y.test <- validation_spl_fe[,winPlacePercColumn]
+
+dtrain <- xgb.DMatrix(data=x.train, label=y.train)
+dval <- xgb.DMatrix(data = x.test, label = y.test)
+
+# After tuning, we choose max_depth=6 and eta=0.01 to fit our model.
+p <- list(objective = 'reg:linear',
+          booster = 'gbtree',
+          eval_metric = 'rmse',
+          eta = .01,
+          max_depth = 6)
+
+set.seed(123)
+xgb1 <- xgb.train(params = p,
+                       data = dtrain,
+                       # nrounds = (100 / (eta * sqrt(max_depth))),
+                       nrounds = 10000,
+                       watchlist = list(train = dtrain, validation = dval),
+                       early_stopping_rounds = 200,
+                       verbose = F,
+                       print_every_n = 200,
+                       maximize = F)
+xgb_pred_train <- predict(xgb1, dtrain)
+xgb_pred_test <- predict(xgb1, dval)
+```
+
+### Model Results
+
+```{r, warning= F}
+#rmse on train data
+rmse_lm_train <- rmse(lm_pred_train, train_spl_fe$winPlacePerc)
+rmse_glmnet_train <- rmse(glmnet_pred_train, train_spl_fe$winPlacePerc)
+rmse_rf_train <- rmse(rf_pred_train, train_spl_fe$winPlacePerc)
+rmse_xgb_train <- rmse(xgb_pred_train, train_spl_fe$winPlacePerc)
+
+#rmse on test data
+rmse_lm_test <- rmse(lm_pred_test, validation_spl_fe$winPlacePerc)
+rmse_glmnet_test <- rmse(glmnet_pred_test, validation_spl_fe$winPlacePerc)
+rmse_rf_test <- rmse(rf_pred_test, validation_spl_fe$winPlacePerc)
+rmse_xgb_test <- rmse(xgb_pred_test, validation_spl_fe$winPlacePerc)
+
+rmse_train <- c(rmse_lm_train, rmse_glmnet_train, rmse_rf_train, rmse_xgb_train)
+rmse_test <- c(rmse_lm_test, rmse_glmnet_test, rmse_rf_test, rmse_xgb_test)
+
+
+rmse_matrix <- matrix(ncol=2, nrow=4)
+rmse_matrix <- cbind(rmse_train,rmse_test)
+rownames(rmse_matrix) <- c("Linear Regression", "LASSO", "RandomForest", "XGBoost")
+colnames(rmse_matrix) <- c("RMSE on train data","RMSE on test data")
+rmse_matrix
+```
+
+**Remark:**
+
+After comparing the RMSE on test data, we can find that the XGBoost model performs the best among the four models. Therefore, we decide to use the result of XGBoost model to predict on the final ranking and to suggest on winning strategy.
+
+```{r}
+importance_matrix <- xgb.importance(model = xgb1, feature_names = colnames(x.train))
+xgb.plot.importance(importance_matrix=importance_matrix)
+
+p1 <- plotPartial(partial(xgb1, train=x.train, pred.var = "boosts", chull = TRUE))
+p2 <- plotPartial(partial(xgb1, train=x.train, pred.var = "kills", chull = TRUE))
+p3 <- plotPartial(partial(xgb1, train=x.train, pred.var = "walkDistance", chull = TRUE))
+
+grid.arrange(p1, p2, p3, nrow = 1)
+```
+
+**Remark:**
+
+From the results of the XGBoost model, we can see the top 10 significant Features are **"walkDistance"**, **"killPlace"**, **"matchDuration"**, **"numGroups"**, **"maxPlace"**, **"kills"**, **"boost"**, **"longestKill"**, **"rideDistance"** and **"DBNOs"**.
+
+The first insight from the model result is walking distance is positively correlated with the final ranking, especially in early stage of game play, within 3km distance. In this game, there is a safe zone which keep shrinking during the game, people who are left out of the zone will be slowly poisoned to death. Players need to travel to chase the safe zone in order to survive. But impact of this strategy diminishes among players travelling for more than 3km. This means normally player will travel 3km to keep himself in the safe zone, more travelling inside the safe zone will not improve the chance of winning this game.The player who know the important of chasing the safe zone have a higher survival chance. Therefore, we suggest that new players need to learn how to chase the safe zone to survive.
+
+The second insight is number of kills actually pulls down your ranking in the game.This may sound counter-intuitive to the veteran FPS players. It actually makes a lot more sense if we deep dive into the mechanism of PUBG. The first differentiator of PUBG versus traditional FPS games is that, when a person dies, they really die. In traditional FPS games, a player could revive after getting killed. However, PUBG is not that case. Death in PUBG means end of the game. This means that no matter how many persons you’ve killed, getting killed will leave you nothing. More importantly, this game is ranked by survival time. Getting more kills does not make you more superior than other players. Gun shots may also attract unnecessary attention, there are always enemies behind you.
+
+The third discovery is the importance of boost items. In PUBG, boost items are those consumables that could either store health or temporarily increase the movement speed. Even though these items may not have drastic effects on your character’s physicality, they could certainly increase your odds of survival in a close combat. The continuous restoration of health and the increased movement speed could give you a slight edge against your opponent. You could possibly live few seconds longer than your opponent and eventually win the fight.
+
+
+## Game Strategy Suggestions
+
+Based on our analysis, our team has come out with 3 core strategies.
+
+Firstly, survival is the key. In the PUBG game, nothing is more important than survival. Regularly evaluating your current position and looking for the next will help you survive. There are a few factors to evaluate the position. Gas zone and war zone. Being part of PUBG mechanism, a player will lose his health point staying in the gas zone. One must keep himself out of the gas zone, or he’ll end up dying. So it’s important to plan ahead the route to avoid gas zone, or you might end up in an awkward position with enemy in front and gas zone at your back.
+ 
+The other factor is war zone. Well, there are some rewards for getting into a war zone, such as better equipment or knockdown your enemy. However, the cost is also extremely high. As explained in earlier slides, you could expose yourself to unpredictable danger in a war zone. Being knockdown by a hidden enemy while you’re collecting your rewards is certainly not a pleasant experience. Hence for most of PUBG players, our advice is, stay away from battle. Keep yourself low and find an opportunity to knock down your celebrating enemy. 
+
+The last winning formula is boost items. Even though it may not sound fancy as killings or knockdowns. It’s indeed more positively correlated to the final ranking. Next time when you are in the game, maybe look around for these supplements. And do remember to consume them before you head into a fight. It is even more important than weapons. 
+
+To summarise, the winning formula for chicken dinner is position, cautiousness and supplements. Remember, PUBG is a surviving game. At the end of the day, the primal importance is to survive and try to avoid wars. 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
